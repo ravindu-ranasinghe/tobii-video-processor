@@ -10,8 +10,24 @@ from typing import Iterable, Optional
 import pandas as pd
 
 
-# Root folder that contains your Tobii recordings
-BASE_DIR = Path("/Users/ravi/Desktop/tobi copy")
+def get_base_dir() -> Path:
+    """
+    Prompt the user for the folder containing Tobii recordings.
+    Repeats until a valid directory path is given.
+    """
+    while True:
+        path_str = input("Enter the path to your Tobii recordings folder: ").strip()
+        if not path_str:
+            print("Please enter a path.")
+            continue
+        path = Path(path_str).expanduser().resolve()
+        if not path.exists():
+            print(f"Path does not exist: {path}")
+            continue
+        if not path.is_dir():
+            print(f"Path is not a directory: {path}")
+            continue
+        return path
 
 
 def find_candidate_data_dirs(root: Path) -> Iterable[Path]:
@@ -128,17 +144,18 @@ def process_unified_parquet(parquet_path: Path) -> Optional[Path]:
 
 
 def main() -> None:
+    base_dir = get_base_dir()
     start_total = time.time()
-    exports_root = BASE_DIR / "exports"
+    exports_root = base_dir / "exports"
     exports_root.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
     print("STEP 1: Unpacking .g3 archives")
     print("=" * 60)
-    unpacked_dirs = list(unpack_g3_archives(BASE_DIR, exports_root))
+    unpacked_dirs = list(unpack_g3_archives(base_dir, exports_root))
 
     # 2. Look for directories that already contain gazedata.gz, imudata.gz, and scenevideo.mp4
-    candidate_dirs = set(find_candidate_data_dirs(BASE_DIR))
+    candidate_dirs = set(find_candidate_data_dirs(base_dir))
     for d in unpacked_dirs:
         candidate_dirs.update(find_candidate_data_dirs(d))
 
@@ -166,7 +183,7 @@ def main() -> None:
             print(f"\n--- Recording {i}/{total} | Elapsed: {elapsed_so_far/60:.1f} min | ~{est_remaining:.0f} min left ---")
         else:
             print(f"\n--- Recording {i}/{total} | Elapsed: {elapsed_so_far/60:.1f} min ---")
-        rel = data_dir.relative_to(BASE_DIR)
+        rel = data_dir.relative_to(base_dir)
         out_parquet = exports_root / rel / "unified.parquet"
 
         if out_parquet.exists():

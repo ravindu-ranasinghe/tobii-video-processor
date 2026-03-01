@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import subprocess
+import sys
+import time
 import zipfile
 from pathlib import Path
 from typing import Iterable, Optional
@@ -35,24 +37,29 @@ def unpack_g3_archives(root: Path, out_root: Path) -> Iterable[Path]:
 
     Returns the paths of the unpacked directories.
     """
-    for g3_file in root.rglob("*.g3"):
-        # Only try to treat it as a zip if it actually is one
-        if not zipfile.is_zipfile(g3_file):
-            print(f"Skipping non-zip .g3 file: {g3_file}")
-            continue
+    all_g3 = list(root.rglob("*.g3"))
+    for f in all_g3:
+        if not zipfile.is_zipfile(f):
+            print(f"Skipping non-zip .g3 file: {f}")
+    g3_files = [f for f in all_g3 if zipfile.is_zipfile(f)]
+    total = len(g3_files)
+    if total == 0:
+        return
 
+    for i, g3_file in enumerate(g3_files, 1):
         target_dir = out_root / (g3_file.stem + "_raw")
         if target_dir.exists():
-            print(f"Already unpacked, skipping: {target_dir}")
+            print(f"[{i}/{total}] Already unpacked, skipping: {target_dir}")
             yield target_dir
             continue
 
-        print(f"Unpacking {g3_file} -> {target_dir}")
+        print(f"[{i}/{total}] Unpacking {g3_file.name} -> {target_dir.name} ...")
+        start = time.time()
         target_dir.mkdir(parents=True, exist_ok=True)
-
         with zipfile.ZipFile(g3_file, "r") as zf:
             zf.extractall(target_dir)
-
+        elapsed = time.time() - start
+        print(f"       Done in {elapsed:.1f}s")
         yield target_dir
 
 
@@ -65,19 +72,21 @@ def run_tobii_munger_convert(data_dir: Path, out_parquet: Path) -> bool:
     out_parquet.parent.mkdir(parents=True, exist_ok=True)
 
     cmd = [
-        "python",
+        sys.executable,
         "-m",
         "tobii_munger.convert",
         str(data_dir),
         str(out_parquet),
     ]
-    print("Running:", " ".join(cmd))
-
+    print("       Running tobii-munger (typically 2-8 min per recording)...")
+    start = time.time()
     try:
         subprocess.run(cmd, check=True)
+        elapsed = time.time() - start
+        print(f"       Converted in {elapsed:.1f}s ({elapsed/60:.1f} min)")
         return True
     except subprocess.CalledProcessError as exc:
-        print(f"tobii-munger failed for {data_dir}: {exc}")
+        print(f"       tobii-munger failed for {data_dir}: {exc}")
         return False
 
 
@@ -90,7 +99,8 @@ def process_unified_parquet(parquet_path: Path) -> Optional[Path]:
         print(f"Parquet file does not exist, skipping: {parquet_path}")
         return None
 
-    print(f"Loading unified data from {parquet_path}")
+    print(f"       Loading parquet and writing cleaned CSV...")
+    start = time.time()
     df = pd.read_parquet(parquet_path)
 
     # Keep time and gaze-related columns
@@ -112,15 +122,19 @@ def process_unified_parquet(parquet_path: Path) -> Optional[Path]:
         parquet_path.stem + "_cleaned.csv"
     )
     cleaned.to_csv(cleaned_path, index=False)
-    print(f"Wrote cleaned CSV to {cleaned_path}")
+    elapsed = time.time() - start
+    print(f"       Wrote {cleaned_path.name} in {elapsed:.1f}s")
     return cleaned_path
 
 
 def main() -> None:
+    start_total = time.time()
     exports_root = BASE_DIR / "exports"
     exports_root.mkdir(parents=True, exist_ok=True)
 
-    # 1. Unpack any .g3 archives we find
+    print("=" * 60)
+    print("STEP 1: Unpacking .g3 archives")
+    print("=" * 60)
     unpacked_dirs = list(unpack_g3_archives(BASE_DIR, exports_root))
 
     # 2. Look for directories that already contain gazedata.gz, imudata.gz, and scenevideo.mp4
@@ -132,23 +146,45 @@ def main() -> None:
         print("No Tobii data directories found (with gazedata.gz / imudata.gz / scenevideo.mp4).")
         return
 
+    sorted_candidates = sorted(candidate_dirs)
+    total = len(sorted_candidates)
+    print("\n" + "=" * 60)
+    print(f"STEP 2: Converting {total} recording(s) to parquet + cleaned CSV")
+    print("=" * 60)
     print("Found candidate data directories:")
-    for d in sorted(candidate_dirs):
+    for d in sorted_candidates:
         print(" -", d)
 
     # 3. For each candidate dir, run tobii-munger and then process the output
-    for data_dir in sorted(candidate_dirs):
+    convert_times: list[float] = []
+    for i, data_dir in enumerate(sorted_candidates, 1):
+        elapsed_so_far = time.time() - start_total
+        remaining = total - i
+        if convert_times:
+            avg_min = sum(convert_times) / len(convert_times) / 60
+            est_remaining = avg_min * remaining
+            print(f"\n--- Recording {i}/{total} | Elapsed: {elapsed_so_far/60:.1f} min | ~{est_remaining:.0f} min left ---")
+        else:
+            print(f"\n--- Recording {i}/{total} | Elapsed: {elapsed_so_far/60:.1f} min ---")
         rel = data_dir.relative_to(BASE_DIR)
         out_parquet = exports_root / rel / "unified.parquet"
 
         if out_parquet.exists():
-            print(f"Unified parquet already exists, skipping convert: {out_parquet}")
+            print(f"       Parquet exists, skipping convert")
         else:
+            step_start = time.time()
             ok = run_tobii_munger_convert(data_dir, out_parquet)
+            if ok:
+                convert_times.append(time.time() - step_start)
             if not ok:
                 continue
 
         process_unified_parquet(out_parquet)
+
+    total_elapsed = time.time() - start_total
+    print("\n" + "=" * 60)
+    print(f"DONE in {total_elapsed/60:.1f} min total")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

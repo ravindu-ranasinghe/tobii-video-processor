@@ -5,9 +5,11 @@ import sys
 import time
 import zipfile
 from pathlib import Path
+import re
 from typing import Iterable, Optional
 
 import pandas as pd
+import polars as pl
 
 
 def get_base_dir() -> Path:
@@ -108,39 +110,74 @@ def run_tobii_munger_convert(data_dir: Path, out_parquet: Path) -> bool:
 
 def process_unified_parquet(parquet_path: Path) -> Optional[Path]:
     """
-    Load a unified Parquet file and write out a 'cleaned' CSV that focuses
-    on time and gaze-related columns. Returns the cleaned CSV path.
+    Load a unified Parquet file and write out CSVs that are actually usable.
+
+    Notes:
+    - `tobii-munger` writes a "long-form" table with columns like:
+      `timestamp`, `type`, `vals` (list)
+    - A single timestamp can appear multiple times (one per `type`)
+    - To make this analysable in Excel/Python, we write one CSV per `type`
+      with `vals` expanded into numeric columns.
+
+    Returns one representative output path (the type summary CSV).
     """
     if not parquet_path.exists():
         print(f"Parquet file does not exist, skipping: {parquet_path}")
         return None
 
-    print(f"       Loading parquet and writing cleaned CSV...")
+    print("       Loading parquet and writing CSV outputs...")
     start = time.time()
-    df = pd.read_parquet(parquet_path)
+    df = pl.read_parquet(parquet_path)
 
-    # Keep time and gaze-related columns
-    cols = [
-        c
-        for c in df.columns
-        if any(
-            key in c.lower()
-            for key in ("time", "timestamp", "gaze", "eyeleft", "eyeright", "pupil")
-        )
-    ]
+    required_cols = {"timestamp", "type", "vals"}
+    if not required_cols.issubset(set(df.columns)):
+        # Fallback: write a simple column-filtered CSV if this isn't tobii-munger's expected schema.
+        pdf = pd.read_parquet(parquet_path)
+        cols = [
+            c
+            for c in pdf.columns
+            if any(
+                key in c.lower()
+                for key in ("time", "timestamp", "gaze", "eyeleft", "eyeright", "pupil")
+            )
+        ]
+        if not cols:
+            print(f"       Unrecognized schema and no matching columns in {parquet_path}, skipping.")
+            return None
+        cleaned_path = parquet_path.with_suffix("").with_name(parquet_path.stem + "_cleaned.csv")
+        pdf[cols].to_csv(cleaned_path, index=False)
+        elapsed = time.time() - start
+        print(f"       Wrote {cleaned_path.name} in {elapsed:.1f}s")
+        return cleaned_path
 
-    if not cols:
-        print(f"No matching gaze/time columns found in {parquet_path}, skipping.")
-        return None
+    out_dir = parquet_path.parent
 
-    cleaned = df[cols]
-    cleaned_path = parquet_path.with_suffix("").with_name(
-        parquet_path.stem + "_cleaned.csv"
+    # 1) Write a small summary so you can quickly see what's inside.
+    type_summary = (
+        df.group_by("type")
+        .len()
+        .sort("len", descending=True)
     )
-    cleaned.to_csv(cleaned_path, index=False)
+    summary_path = out_dir / f"{parquet_path.stem}_types.csv"
+    type_summary.write_csv(summary_path)
+
+    # 2) Write one CSV per type, expanding vals -> value_0, value_1, ...
+    types = df.select("type").unique().to_series().to_list()
+    for t in types:
+        safe_type = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(t))
+        sub = df.filter(pl.col("type") == t).select(["timestamp", "vals"])
+        max_len = sub.select(pl.col("vals").list.len().max()).item()
+        if max_len is None:
+            continue
+        expanded = sub.with_columns(
+            [pl.col("vals").list.get(i).alias(f"value_{i}") for i in range(int(max_len))]
+        ).drop("vals")
+        out_path = out_dir / f"{parquet_path.stem}_{safe_type}.csv"
+        expanded.write_csv(out_path)
+
     elapsed = time.time() - start
-    print(f"       Wrote {cleaned_path.name} in {elapsed:.1f}s")
-    return cleaned_path
+    print(f"       Wrote CSVs (summary + per-type) in {elapsed:.1f}s")
+    return summary_path
 
 
 def main() -> None:
